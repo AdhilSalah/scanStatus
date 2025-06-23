@@ -34,7 +34,7 @@ class RestartResponse(BaseModel):
 app = FastAPI(title="Scan Job Manager", description="MongoDB Scan Job Management System")
 
 # MongoDB connection
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27018")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = MongoClient(MONGO_URI)
 
 # HTTP client for external API calls
@@ -62,79 +62,95 @@ def serialize_mongo_doc(doc):
         return result
     return doc
 
-async def get_scan_jobs_by_status(status_filter: str = None,search:str = None) -> List[ScanJob]:
-    """Get scan jobs from all databases, optionally filtered by status"""
+async def get_scan_jobs_by_status(status_filter: str = None, search: str = None, 
+                         tenant_filter: str = None, page: int = 1, page_size: int = 10) -> Dict[str, Any]:
+    """Get scan jobs from all databases, optionally filtered by status, search query, and tenant
+    
+    Returns a dictionary with total count and paginated results
+    """
     jobs = []
+    all_jobs = []  # Store all jobs for counting
     
     # Get all database names
-    db_names = client.list_database_names()
-    
-    for db_name in db_names:
-        # Skip system databases
-        if db_name in ['admin', 'local', 'config']:
-            continue
+    tenant_db_name = client['asd_remus_qc']
+    tenant_collection = tenant_db_name['tenants']
+    tenant = tenant_collection.find_one({"name": tenant_filter}) if tenant_filter else None
+
             
-        try:
-            db = client[db_name]
-            
-            # Check if scan_job collection exists
-            if 'scan_job' in db.list_collection_names():
-                collection = db['scan_job']
+    try:
+        db = client[tenant["db_name"]]
+        # Check if scan_job collection exists
+
+        collection = db['scan_jobs_asset_discovery']
+        
+        # Build query based on status filter
+        query = {"is_latest": True}
+        if search:
+            query["$or"] = [
+                {"domain": {"$regex": search, "$options": "i"}},
+                {"tenant_id": {"$regex": search, "$options": "i"}},
+                {"error_message": {"$regex": search, "$options": "i"}}
+            ]
+        if status_filter:
+            if status_filter == "failed":
+                query["status"] = "failed"
+            elif status_filter == "completed":
+                query["status"] = {"$in": ["completed"]}
+            elif status_filter == "running":
+                query["status"] = {"$in": ["running"]}
+        
+        # Add tenant filter if provided
+        if tenant_filter:
+            query["tenant_id"] = tenant["_id"]
+        
+        # Find jobs matching the criteria
+        job_docs = collection.find(query).skip((page-1)*page_size).limit(page_size).sort("created_at", -1)
+        for doc in job_docs:
+            serialized_doc = serialize_mongo_doc(doc)
+            if serialized_doc:
+                # Calculate duration if we have both created_at and completed_at
+                duration = None
+                if (serialized_doc.get("created_at") and 
+                    serialized_doc.get("completed_at")):
+                    try:
+                        created = datetime.fromisoformat(serialized_doc["created_at"].replace('Z', '+00:00'))
+                        completed = datetime.fromisoformat(serialized_doc["completed_at"].replace('Z', '+00:00'))
+                        duration = int((completed - created).total_seconds())
+                    except:
+                        pass
                 
-                # Build query based on status filter
-                query = {"is_latest": True}
-                if search:
-                    query["$or"] = [
-                        {"domain": {"$regex": search, "$options": "i"}},
-                        {"tenant_id": {"$regex": search, "$options": "i"}},
-                        {"error_message": {"$regex": search, "$options": "i"}}
-                    ]
-                if status_filter:
-                    if status_filter == "failed":
-                        query["status"] = "failed"
-                    elif status_filter == "completed":
-                        query["status"] = {"$in": ["completed", "success"]}
-                    elif status_filter == "running":
-                        query["status"] = {"$in": ["running", "in_progress"]}
+                scan_job = ScanJob(
+                    id=serialized_doc.get("id", ""),
+                    database=tenant["db_name"] if tenant else "unknown_db",
+                    collection="scan_jobs_asset_discovery",
+                    status=serialized_doc.get("status", "unknown"),
+                    is_latest=serialized_doc.get("is_latest", False),
+                    tenant_id=serialized_doc.get("tenant_id", ""),
+                    domain=serialized_doc.get("domain", ""),
+                    created_at=serialized_doc.get("created_at"),
+                    completed_at=serialized_doc.get("completed_at"),
+                    error_message=serialized_doc.get("error_message"),
+                    duration=duration,
+                    documents_processed=serialized_doc.get("documents_processed")
+                )
+                all_jobs.append(scan_job)
                 
-                # Find jobs matching the criteria
-                job_docs = collection.find(query).sort("created_at", -1)
-                
-                for doc in job_docs:
-                    serialized_doc = serialize_mongo_doc(doc)
-                    if serialized_doc:
-                        # Calculate duration if we have both created_at and completed_at
-                        duration = None
-                        if (serialized_doc.get("created_at") and 
-                            serialized_doc.get("completed_at")):
-                            try:
-                                created = datetime.fromisoformat(serialized_doc["created_at"].replace('Z', '+00:00'))
-                                completed = datetime.fromisoformat(serialized_doc["completed_at"].replace('Z', '+00:00'))
-                                duration = int((completed - created).total_seconds())
-                            except:
-                                pass
-                        
-                        scan_job = ScanJob(
-                            id=serialized_doc.get("id", ""),
-                            database=db_name,
-                            collection="scan_job",
-                            status=serialized_doc.get("status", "unknown"),
-                            is_latest=serialized_doc.get("is_latest", False),
-                            tenant_id=serialized_doc.get("tenant_id", ""),
-                            domain=serialized_doc.get("domain", ""),
-                            created_at=serialized_doc.get("created_at"),
-                            completed_at=serialized_doc.get("completed_at"),
-                            error_message=serialized_doc.get("error_message"),
-                            duration=duration,
-                            documents_processed=serialized_doc.get("documents_processed")
-                        )
-                        jobs.append(scan_job)
-                        
-        except Exception as e:
-            print(f"Error accessing database {db_name}: {str(e)}")
-            continue
+    except Exception as e:
+        print(f"Error accessing database: {str(e)}")
+
     
-    return jobs
+    # Calculate total count
+    total_count = collection.count_documents(query)
+    
+    # Apply pagination
+    paginated_jobs = all_jobs
+    return {
+        "total": total_count,
+        "items": paginated_jobs,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total_count + page_size - 1) // page_size  # Ceiling division
+    }
 
 async def restart_scan(job_id: str) -> bool:
     """Restart a scan by calling the external API"""
@@ -401,7 +417,7 @@ async def read_root():
         .jobs-header {
             display: flex;
             justify-content: space-between;
-            align-items: center;
+            align-items: flex-start;
             margin-bottom: 2rem;
             flex-wrap: wrap;
             gap: 1rem;
@@ -413,17 +429,25 @@ async def read_root():
             font-weight: 700;
         }
         
+        .jobs-filters {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            min-width: 320px;
+        }
+        
         .search-box {
             position: relative;
-            max-width: 320px;
             width: 100%;
+            display: flex;
+            align-items: center;
         }
         
         .search-box input {
-            width: 100%;
+            flex: 1;
             padding: 1rem 1.25rem 1rem 3rem;
             border: 1px solid rgba(148, 163, 184, 0.2);
-            border-radius: 16px;
+            border-radius: 16px 0 0 16px;
             font-size: 0.95rem;
             transition: all 0.3s ease;
             background: rgba(30, 41, 59, 0.5);
@@ -449,6 +473,110 @@ async def read_root():
             transform: translateY(-50%);
             color: #64748b;
             font-size: 1.1rem;
+            z-index: 1;
+        }
+        
+        .search-btn {
+            border-radius: 0 16px 16px 0 !important;
+            height: 100%;
+            padding-top: 0;
+            padding-bottom: 0;
+        }
+        
+        .tenant-filter {
+            display: flex;
+            gap: 0.5rem;
+            width: 100%;
+        }
+        
+        .tenant-filter select {
+            flex: 1;
+            padding: 1rem 1.25rem;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            border-radius: 16px;
+            font-size: 0.95rem;
+            transition: all 0.3s ease;
+            background: rgba(30, 41, 59, 0.5);
+            backdrop-filter: blur(10px);
+            color: #ffffff;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 1rem center;
+        }
+        
+        .tenant-filter select:focus {
+            outline: none;
+            border-color: #3b82f6;
+            background-color: rgba(30, 41, 59, 0.8);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+        
+        .btn-secondary {
+            background: rgba(51, 65, 85, 0.8);
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background: rgba(71, 85, 105, 0.9);
+            transform: translateY(-2px);
+        }
+        
+        .pagination {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-top: 2rem;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+        
+        .pagination-btn {
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 10px;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            background: rgba(30, 41, 59, 0.5);
+            color: #ffffff;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .pagination-btn:hover:not(:disabled) {
+            background: rgba(51, 65, 85, 0.7);
+            transform: translateY(-2px);
+        }
+        
+        .pagination-btn.active {
+            background: #3b82f6;
+            border-color: #3b82f6;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        }
+        
+        .pagination-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .pagination-ellipsis {
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #94a3b8;
+        }
+        
+        .pagination-info {
+            margin-left: 1rem;
+            color: #94a3b8;
+            font-size: 0.9rem;
         }
         
         .jobs-grid {
@@ -739,14 +867,31 @@ async def read_root():
             .jobs-header {
                 flex-direction: column;
                 text-align: center;
+                align-items: center;
+            }
+            
+            .jobs-filters {
+                min-width: 100%;
             }
             
             .search-box {
-                max-width: 100%;
+                width: 100%;
             }
 
             .job-details {
                 grid-template-columns: 1fr;
+            }
+            
+            .pagination {
+                flex-wrap: wrap;
+                justify-content: center;
+            }
+            
+            .pagination-info {
+                width: 100%;
+                text-align: center;
+                margin-top: 1rem;
+                margin-left: 0;
             }
         }
     </style>
@@ -836,9 +981,37 @@ async def read_root():
         <div class="jobs-container">
             <div class="jobs-header">
                 <h2 x-text="getFilterTitle()"></h2>
-                <div class="search-box">
-                    <div class="search-icon">🔍</div>
-                    <input type="text" x-model="searchQuery" placeholder="Search jobs...">
+                <div class="jobs-filters">
+                    <div class="search-box">
+                        <div class="search-icon">🔍</div>
+                        <input 
+                            type="text" 
+                            x-model="searchQuery" 
+                            placeholder="Search jobs..." 
+                            @keyup.enter="handleSearch()">
+                        <button 
+                            class="btn btn-sm btn-primary search-btn" 
+                            @click="handleSearch()"
+                            :disabled="loading">
+                            Search
+                        </button>
+                    </div>
+                    
+                    <div class="tenant-filter">
+                        <select x-model="tenantFilter" @change="setTenantFilter(tenantFilter)" required>
+                            <option value="" disabled>Select a Tenant</option>
+                            <template x-for="tenant in tenants" :key="tenant">
+                                <option :value="tenant" x-text="tenant"></option>
+                            </template>
+                        </select>
+                        <button 
+                            class="btn btn-sm btn-secondary" 
+                            @click="clearFilters()"
+                            x-show="searchQuery"
+                            :disabled="loading">
+                            Clear Search
+                        </button>
+                    </div>
                 </div>
             </div>
             
@@ -918,6 +1091,64 @@ async def read_root():
                     </div>
                 </template>
             </div>
+            
+            <!-- Pagination -->
+            <div class="pagination" x-show="!loading && totalPages > 1">
+                <button 
+                    class="pagination-btn" 
+                    @click="goToPage(1)" 
+                    :disabled="currentPage === 1"
+                    title="First Page">
+                    &laquo;
+                </button>
+                <button 
+                    class="pagination-btn" 
+                    @click="goToPage(currentPage - 1)" 
+                    :disabled="currentPage === 1"
+                    title="Previous Page">
+                    &lsaquo;
+                </button>
+                
+                <template x-for="page in Math.min(5, totalPages)">
+                    <button 
+                        class="pagination-btn" 
+                        :class="{ active: currentPage === page }"
+                        @click="goToPage(page)">
+                        <span x-text="page"></span>
+                    </button>
+                </template>
+                
+                <span x-show="totalPages > 5 && currentPage < totalPages - 2" class="pagination-ellipsis">...</span>
+                
+                <template x-if="totalPages > 5 && currentPage < totalPages - 1">
+                    <button 
+                        class="pagination-btn" 
+                        :class="{ active: currentPage === totalPages }"
+                        @click="goToPage(totalPages)">
+                        <span x-text="totalPages"></span>
+                    </button>
+                </template>
+                
+                <button 
+                    class="pagination-btn" 
+                    @click="goToPage(currentPage + 1)" 
+                    :disabled="currentPage === totalPages"
+                    title="Next Page">
+                    &rsaquo;
+                </button>
+                <button 
+                    class="pagination-btn" 
+                    @click="goToPage(totalPages)" 
+                    :disabled="currentPage === totalPages"
+                    title="Last Page">
+                    &raquo;
+                </button>
+                
+                <div class="pagination-info">
+                    Page <span x-text="currentPage"></span> of <span x-text="totalPages"></span>
+                    (<span x-text="totalItems"></span> items)
+                </div>
+            </div>
         </div>
         
         <div class="toast" :class="[toastType, { show: showToast }]">
@@ -930,44 +1161,34 @@ async def read_root():
             return {
                 allJobs: [],
                 searchQuery: '',
+                tenantFilter: '',
+                tenants: [],
                 loading: false,
                 showToast: false,
                 toastMessage: '',
                 toastType: 'success',
                 recentRestarts: 0,
                 activeFilter: 'failed',
+                currentPage: 1,
+                pageSize: 10,
+                totalPages: 1,
+                totalItems: 0,
                 
                 init() {
-                    this.loadJobs();
-                    // Auto-refresh every 30 seconds
-                    setInterval(() => {
-                        if (!this.loading) {
-                            this.loadJobs();
-                        }
-                    }, 30000);
+                    this.loadTenants();
+                    // Jobs will be loaded after tenant is selected in loadTenants
                 },
                 
                 get filteredJobs() {
-                    let jobs = this.getJobsByFilter(this.activeFilter);
-                    
-                    if (!this.searchQuery) return jobs;
-                    
-                    const query = this.searchQuery.toLowerCase();
-                    return jobs.filter(job => 
-                        job.database.toLowerCase().includes(query) ||
-                        job.collection.toLowerCase().includes(query) ||
-                        job.id.toLowerCase().includes(query) ||
-                        job.domain.toLowerCase().includes(query) ||
-                        (job.error_message && job.error_message.toLowerCase().includes(query))
-                    );
+                    return this.allJobs;
                 },
                 
                 get jobCounts() {
                     return {
-                        all: this.allJobs.length,
-                        failed: this.getJobsByFilter('failed').length,
-                        completed: this.getJobsByFilter('completed').length,
-                        running: this.getJobsByFilter('running').length
+                        all: this.totalItems,
+                        failed: this.activeFilter === 'failed' ? this.totalItems : 0,
+                        completed: this.activeFilter === 'completed' ? this.totalItems : 0,
+                        running: this.activeFilter === 'running' ? this.totalItems : 0
                     };
                 },
                 
@@ -982,23 +1203,54 @@ async def read_root():
                     });
                 },
                 
-                getJobsByFilter(filter) {
-                    switch (filter) {
-                        case 'failed':
-                            return this.allJobs.filter(job => job.status === 'failed');
-                        case 'completed':
-                            return this.allJobs.filter(job => job.status === 'completed' || job.status === 'success');
-                        case 'running':
-                            return this.allJobs.filter(job => job.status === 'running' || job.status === 'in_progress');
-                        case 'all':
-                        default:
-                            return this.allJobs;
+                async loadTenants() {
+                    try {
+                        const response = await axios.get('/api/tenants');
+                        this.tenants = response.data;
+                        
+                        if (this.tenants.length === 0) {
+                            this.showToastMessage('No tenants found. Please check the database configuration.', 'error');
+                        } else {
+                            // Select the first tenant by default if none is selected
+                            if (!this.tenantFilter) {
+                                this.tenantFilter = this.tenants[0];
+                                this.loadJobs(); // Reload jobs with the selected tenant
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error loading tenants:', error);
+                        this.showToastMessage('Failed to load tenants: ' + (error.response?.data?.detail || error.message), 'error');
                     }
                 },
                 
                 setActiveFilter(filter) {
                     this.activeFilter = filter;
-                    this.searchQuery = ''; // Clear search when changing filters
+                    this.currentPage = 1;
+                    
+                    // Ensure a tenant is selected
+                    if (!this.tenantFilter && this.tenants.length > 0) {
+                        this.tenantFilter = this.tenants[0];
+                    }
+                    
+                    this.loadJobs();
+                },
+                
+                setTenantFilter(tenant) {
+                    this.tenantFilter = tenant;
+                    this.currentPage = 1;
+                    this.loadJobs();
+                },
+                
+                clearFilters() {
+                    this.searchQuery = '';
+                    this.currentPage = 1;
+                    this.loadJobs();
+                },
+                
+                goToPage(page) {
+                    if (page < 1 || page > this.totalPages) return;
+                    this.currentPage = page;
+                    this.loadJobs();
                 },
                 
                 getFilterTitle() {
@@ -1086,17 +1338,55 @@ async def read_root():
                 },
                 
                 async loadJobs() {
+                    // Ensure a tenant is selected
+                    if (!this.tenantFilter && this.tenants.length > 0) {
+                        this.tenantFilter = this.tenants[0];
+                        this.showToastMessage('A tenant is required. Selected the first tenant.', 'info');
+                    } else if (!this.tenantFilter) {
+                        // If no tenants are loaded yet, wait for them
+                        this.showToastMessage('Loading tenants...', 'info');
+                        return;
+                    }
+                    
                     this.loading = true;
                     try {
-                        const response = await axios.get('/api/all-jobs');
-                        this.allJobs = response.data;
+                        let url = `/api/${this.activeFilter === 'all' ? 'all' : this.activeFilter}-jobs`;
+                        console.log(`Loading jobs from: ${url}`);
+                        url += `?page=${this.currentPage}&page_size=${this.pageSize}`;
+                        
+                        if (this.searchQuery) {
+                            url += `&search=${encodeURIComponent(this.searchQuery)}`;
+                        }
+                        
+                        // Always include tenant parameter
+                        url += `&tenant=${encodeURIComponent(this.tenantFilter)}`;
+                        
+                        const response = await axios.get(url);
+                        this.allJobs = response.data.items;
+                        this.totalItems = response.data.total;
+                        this.totalPages = response.data.pages;
+                        this.currentPage = response.data.page;
+                        
                         this.showToastMessage('Jobs loaded successfully', 'success');
                     } catch (error) {
                         console.error('Error loading jobs:', error);
-                        this.showToastMessage('Failed to load jobs', 'error');
+                        if (error.response && error.response.status === 400) {
+                            this.showToastMessage('Tenant selection is required', 'error');
+                        } else {
+                            this.showToastMessage('Failed to load jobs', 'error');
+                        }
                     } finally {
                         this.loading = false;
                     }
+                },
+                
+                handleSearch() {
+                    if (!this.tenantFilter && this.tenants.length > 0) {
+                        this.tenantFilter = this.tenants[0];
+                        this.showToastMessage('A tenant is required. Selected the first tenant.', 'info');
+                    }
+                    this.currentPage = 1;
+                    this.loadJobs();
                 },
                 
                 async restartJob(job) {
@@ -1181,28 +1471,63 @@ async def read_root():
 
 # API Endpoints
 @app.get("/api/failed-jobs")
-async def get_failed_jobs():
-    """Get all failed scan jobs"""
-    jobs = await get_scan_jobs_by_status("failed")
-    return jobs
+async def get_failed_jobs(page: int = 1, page_size: int = 10, tenant: str = None, search: Optional[str] = None):
+    """Get all failed scan jobs with pagination"""
+    if not tenant:
+        raise HTTPException(status_code=400, detail="Tenant ID is required")
+    result = await get_scan_jobs_by_status("failed", search=search, tenant_filter=tenant, page=page, page_size=page_size)
+    return result
 
 @app.get("/api/completed-jobs")
-async def get_completed_jobs():
-    """Get all completed scan jobs"""
-    jobs = await get_scan_jobs_by_status("completed")
-    return jobs
+async def get_completed_jobs(page: int = 1, page_size: int = 10, tenant: str = None, search: Optional[str] = None):
+    """Get all completed scan jobs with pagination"""
+    if not tenant:
+        raise HTTPException(status_code=400, detail="Tenant ID is required")
+    result = await get_scan_jobs_by_status("completed", search=search, tenant_filter=tenant, page=page, page_size=page_size)
+    return result
 
 @app.get("/api/running-jobs")
-async def get_running_jobs():
-    """Get all running scan jobs"""
-    jobs = await get_scan_jobs_by_status("running")
-    return jobs
+async def get_running_jobs(page: int = 1, page_size: int = 10, tenant: str = None, search: Optional[str] = None):
+    """Get all running scan jobs with pagination"""
+    if not tenant:
+        raise HTTPException(status_code=400, detail="Tenant ID is required")
+    result = await get_scan_jobs_by_status("running", search=search, tenant_filter=tenant, page=page, page_size=page_size)
+    return result
 
 @app.get("/api/all-jobs")
-async def get_all_jobs(search: Optional[str] = None):
-    """Get all scan jobs regardless of status, with optional search"""
-    jobs = await get_scan_jobs_by_status(search=search)
-    return jobs
+async def get_all_jobs(page: int = 1, page_size: int = 10, tenant: str = None, search: Optional[str] = None):
+    """Get all scan jobs regardless of status, with pagination, filtering and search"""
+    if not tenant:
+        raise HTTPException(status_code=400, detail="Tenant ID is required")
+    result = await get_scan_jobs_by_status(None, search=search, tenant_filter=tenant, page=page, page_size=page_size)
+    return result
+
+@app.get("/api/tenants")
+async def get_all_tenants():
+    """Get a list of all unique tenant IDs"""
+    tenants = set()
+    
+    # Get all database names
+            
+    try:
+        db = client['asd_remus_qc']
+        
+        # Check if scan_job collection exists
+        
+        collection = db['tenants']
+        
+        # Find distinct tenant_ids
+        tenant_docs = collection.find({})  # Cursor
+
+        for tenant in tenant_docs:
+            if 'name' in tenant:
+                tenants.add(tenant['name'])
+                    
+    except Exception as e:
+        print(f"Error accessing database: {str(e)}")
+
+    
+    return list(tenants)
 
 @app.post("/api/restart-job/{job_id}")
 async def restart_job(job_id: str):
